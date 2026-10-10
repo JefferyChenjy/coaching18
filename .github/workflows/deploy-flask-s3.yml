@@ -53,8 +53,8 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          # TODO: Create AWS_ROLE_ARN as a GitHub Actions repository variable.
+          role-to-assume: ${{ vars.OIDC_ROLE }}
+          # TODO: Create OIDC_ROLE as a GitHub Actions repository variable.
           # Value: ARN of the IAM role GitHub Actions assumes using OIDC.
           aws-region: ${{ vars.AWS_REGION }}
           # TODO: Create AWS_REGION as a GitHub Actions repository variable.
