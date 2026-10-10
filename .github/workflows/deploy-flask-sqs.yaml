@@ -1,0 +1,195 @@
+name: Flask SQS checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/sqs/**"
+      - ".github/workflows/deploy-flask-sqs.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/sqs/**"
+      - ".github/workflows/deploy-flask-sqs.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build SQS image
+        run: docker build -t coaching18-sqs:ci ./apps/sqs
+
+      - name: Check Python syntax
+        run: |
+          docker run --rm coaching18-sqs:ci \
+            python -c "import ast; from pathlib import Path; ast.parse(Path('app.py').read_text()); print('Python syntax OK')"
+
+      - name: Test Flask endpoints
+        run: |
+          docker run --rm \
+            -e AWS_REGION=us-east-1 \
+            -e QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/local-test \
+            -e AWS_ACCESS_KEY_ID=local-test \
+            -e AWS_SECRET_ACCESS_KEY=local-test \
+            coaching18-sqs:ci python -c "
+          from app import app
+          client = app.test_client()
+          response = client.get('/health')
+          assert response.status_code == 200
+          assert response.get_json() == {'status': 'ok'}
+          assert client.get('/send').status_code == 200
+          assert client.post('/send', data={'message': ''}).status_code == 400
+          print('Flask endpoint checks passed')
+          "
+
+  deploy:
+    name: Deploy SQS application
+    needs: check
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      vars.SQS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      id-token: write
+
+    concurrency:
+      group: sqs-production-deployment
+      cancel-in-progress: false
+
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: ${{ vars.SQS_ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.SQS_ECS_SERVICE }}
+      CONTAINER_NAME: ${{ vars.SQS_CONTAINER_NAME }}
+      OIDC_ROLE: ${{ vars.OIDC_ROLE }}
+
+    steps:
+      - name: Check deployment settings
+        run: |
+          for setting in ECR_REPOSITORY ECS_CLUSTER ECS_SERVICE CONTAINER_NAME OIDC_ROLE; do
+            if [ -z "${!setting}" ]; then
+              echo "::error::Missing repository variable: $setting"
+              exit 1
+            fi
+          done
+
+      - name: Download repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Sign in to AWS
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.OIDC_ROLE }}
+          aws-region: us-east-1
+
+      - name: Check ECS service and task definition
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" > service.json
+
+          jq -e '
+            (.failures | length) == 0 and
+            (.services | length) == 1 and
+            .services[0].status == "ACTIVE" and
+            .services[0].desiredCount > 0 and
+            .services[0].deploymentController.type == "ECS"
+          ' service.json > /dev/null || {
+            echo "::error::ECS service is not ready for deployment."
+            exit 1
+          }
+
+          TASK_DEFINITION=$(jq -r '.services[0].taskDefinition' service.json)
+
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION" \
+            --query taskDefinition > task-definition.json
+
+          jq -e --arg name "$CONTAINER_NAME" '
+            [.containerDefinitions[] | select(.name == $name)] |
+            length == 1
+          ' task-definition.json > /dev/null || {
+            echo "::error::SQS_CONTAINER_NAME does not match the task definition."
+            exit 1
+          }
+
+      - name: Build and upload SQS image
+        id: image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          REPOSITORY_URI=$(aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          REGISTRY="${REPOSITORY_URI%%/*}"
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$REGISTRY"
+
+          IMAGE="$REPOSITORY_URI:$IMAGE_TAG"
+
+          docker build --platform linux/amd64 \
+            -t "$IMAGE" ./apps/sqs
+          docker push "$IMAGE"
+
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register task revision and deploy
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+        run: |
+          set -euo pipefail
+
+          jq --arg name "$CONTAINER_NAME" --arg image "$IMAGE_URI" '
+            .containerDefinitions |= map(
+              if .name == $name then .image = $image else . end
+            ) |
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+          ' task-definition.json > updated-task-definition.json
+
+          NEW_TASK_DEFINITION=$(aws ecs register-task-definition \
+            --cli-input-json file://updated-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$NEW_TASK_DEFINITION" > /dev/null
+
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
