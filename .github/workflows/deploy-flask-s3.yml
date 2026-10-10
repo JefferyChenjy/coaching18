@@ -1,0 +1,110 @@
+
+name: Build and Deploy S3 Application
+
+on:
+  push:
+    branches:
+      - main
+      - feature/s3  # TODO: Change if your feature branch has a different name
+    paths:
+      - "flask-s3-service/**"
+      - ".github/workflows/deploy-flask-s3.yml"
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "flask-s3-service/**"
+      - ".github/workflows/deploy-flask-s3.yml"
+
+permissions:
+  contents: read
+  id-token: write  # Required for GitHub OIDC authentication to AWS
+
+jobs:
+  build:
+    name: Build S3 Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t s3-app:${{ github.sha }} \
+            flask-s3-service
+        # Builds the Docker image using the Dockerfile in flask-s3-service/
+
+  deploy:
+    name: Deploy S3 Application to ECS
+
+    # Only deploy after a push to main, never from feature/s3 or a PR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          # TODO: Create AWS_ROLE_ARN as a GitHub Actions repository variable.
+          # Value: ARN of the IAM role GitHub Actions assumes using OIDC.
+          aws-region: ${{ vars.AWS_REGION }}
+          # TODO: Create AWS_REGION as a GitHub Actions repository variable.
+          # Example: us-east-1 (confirm your team's actual AWS region).
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push S3 image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          # Automatically returned by the ECR login action.
+          REPOSITORY: ${{ vars.S3_ECR_REPOSITORY }}
+          # TODO: Create S3_ECR_REPOSITORY as a GitHub Actions repository variable.
+          # Value: Name of the ECR repository for the S3 application.
+          IMAGE_TAG: ${{ github.sha }}
+          # Automatically generated from the current Git commit.
+        run: |
+          docker build \
+            -t "$REGISTRY/$REPOSITORY:$IMAGE_TAG" \
+            -t "$REGISTRY/$REPOSITORY:latest" \
+            flask-s3-service
+
+          docker push "$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$REPOSITORY:latest"
+
+      - name: Deploy S3 application to ECS
+        env:
+          CLUSTER: ${{ vars.ECS_CLUSTER }}
+          # TODO: Create ECS_CLUSTER as a GitHub Actions repository variable.
+          # Value: Name of the ECS cluster created by your IaC teammate.
+          SERVICE: ${{ vars.S3_ECS_SERVICE }}
+          # TODO: Create S3_ECS_SERVICE as a GitHub Actions repository variable.
+          # Value: Name of the ECS service running your S3 application.
+        run: |
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --force-new-deployment
+
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE"
+
+# TODO: Before deployment, confirm with your IaC teammate:
+# 1. The S3 ECR repository, ECS cluster and S3 ECS service have been created.
+# 2. The GitHub OIDC IAM role trusts this GitHub repository.
+# 3. The role has permissions to push to the S3 ECR repository and update the S3 ECS service.
+# 4. The S3 ECS task definition uses the "latest" image tag and the correct ECR repository.
+# 5. The ECS task role allows s3:PutObject to your team's S3 bucket.
+# 6. The ECS task definition provides AWS_REGION and BUCKET_NAME
+#    as environment variables to the Flask container.
